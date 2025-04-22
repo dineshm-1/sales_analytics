@@ -1,12 +1,27 @@
 from confluent_kafka import Consumer, KafkaException, TopicPartition
 import sys
 import logging
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def browse_kafka_topic(bootstrap_servers, topic, jaas_config, group_id, start_offset):
+def read_jaas_config(jaas_file_path):
+    """Read JAAS configuration from a file."""
+    if not os.path.exists(jaas_file_path):
+        raise FileNotFoundError(f"JAAS config file not found: {jaas_file_path}")
+    with open(jaas_file_path, 'r') as file:
+        return file.read().strip()
+
+def browse_kafka_topic(bootstrap_servers, topic, jaas_file_path, group_id, start_offset):
+    # Read JAAS configuration from file
+    try:
+        jaas_config = read_jaas_config(jaas_file_path)
+    except Exception as e:
+        logger.error(f"Failed to read JAAS config: {e}")
+        return
+
     # Kafka consumer configuration
     conf = {
         'bootstrap.servers': bootstrap_servers,
@@ -72,12 +87,8 @@ if __name__ == "__main__":
     BOOTSTRAP_SERVERS = "your-bootstrap-servers:9092"  # e.g., 'kafka1:9092,kafka2:9092'
     TOPIC = "your-topic-name"
     GROUP_ID = "kafka-browser-group"
-    JAAS_CONFIG = (
-        'org.apache.kafka.common.security.plain.PlainLoginModule required '
-        'username="your-username" '
-        'password="your-password";'
-    )
+    JAAS_FILE_PATH = "jaas.conf"  # Path to JAAS config file
     START_OFFSET = 0  # Start from this offset for each partition
 
     # Run the consumer
-    browse_kafka_topic(BOOTSTRAP_SERVERS, TOPIC, JAAS_CONFIG, GROUP_ID, START_OFFSET)
+    browse_kafka_topic(BOOTSTRAP_SERVERS, TOPIC, JAAS_FILE_PATH, GROUP_ID, START_OFFSET)
