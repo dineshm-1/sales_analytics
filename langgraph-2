@@ -1,0 +1,167 @@
+from langchain_core.language_models.llms import BaseLLM
+from langchain_core.tools import BaseTool
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, Optional, List
+from langchain_core.outputs import LLMResult, Generation
+import sqlite3
+
+# Set up SQLite database
+conn = sqlite3.connect(':memory:')
+cursor = conn.cursor()
+cursor.execute('''
+CREATE TABLE employees (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    department TEXT
+)
+''')
+sample_data = [
+    (1, 'Alice', 'sales'),
+    (2, 'Bob', 'engineering'),
+    (3, 'Charlie', 'sales'),
+    (4, 'David', 'marketing'),
+]
+cursor.executemany('INSERT INTO employees VALUES (?, ?, ?)', sample_data)
+conn.commit()
+
+# Define custom LLM
+class CustomLLM(BaseLLM):
+    def _generate(self, prompts: List[str], stop: Optional[List[str]] = None) -> LLMResult:
+        generations = []
+        for prompt in prompts:
+            if "employees" in prompt.lower():
+                response = "SQL"
+            elif "company" in prompt.lower() or "product" in prompt.lower():
+                response = "RAG"
+            elif "capital of france" in prompt.lower():
+                response = "The capital of France is Paris."
+            else:
+                response = "I don't know."
+            generations.append([Generation(text=response)])
+        return LLMResult(generations=generations)
+    
+    @property
+    def _llm_type(self) -> str:
+        return "custom_llm"
+
+# Define text-to-SQL tool
+class TextToSQLTool(BaseTool):
+    name: str = "text_to_sql"
+    description: str = "Convert natural language query to SQL and execute it."
+
+    def _run(self, query: str) -> str:
+        if "how many employees in" in query.lower():
+            department = query.lower().split("how many employees in")[1].strip()
+            sql_query = f"SELECT COUNT(*) FROM employees WHERE department = '{department}'"
+        elif "list employees in" in query.lower():
+            department = query.lower().split("list employees in")[1].strip()
+            sql_query = f"SELECT * FROM employees WHERE department = '{department}'"
+        else:
+            return "Sorry, I couldn't understand the query."
+
+        try:
+            cursor.execute(sql_query)
+            results = cursor.fetchall()
+            if "COUNT" in sql_query:
+                return f"There are {results[0][0]} employees in the {department} department."
+            else:
+                return "\n".join([str(row) for row in results])
+        except Exception as e:
+            return f"Error executing SQL query: {e}"
+
+# Define RAG tool
+documents = {
+    "company history": "Our company was founded in 2000 by John Doe. It started as a small startup and grew to a multinational corporation.",
+    "product information": "Our main product is a software solution for managing enterprise resources, known for its efficiency and scalability.",
+    "contact information": "You can contact us at contact@company.com or call us at 123-456-7890."
+}
+
+class RAGTool(BaseTool):
+    name: str = "rag_tool"
+    description: str = "Retrieve relevant documents and generate a response."
+
+    def _run(self, query: str) -> str:
+        for key in documents:
+            if key in query.lower():
+                retrieved_doc = documents[key]
+                break
+        else:
+            retrieved_doc = "No relevant document found."
+        return retrieved_doc
+
+# Define state
+class State(TypedDict):
+    query: str
+    decision: str
+    answer: str
+
+# Initialize components
+custom_llm = CustomLLM()
+text_to_sql_tool = TextToSQLTool()
+rag_tool = RAGTool()
+
+# Define nodes
+def llm_node(state: State) -> State:
+    query = state["query"]
+    response = custom_llm.invoke(query)
+    if response in ["SQL", "RAG"]:
+        state["decision"] = response
+    else:
+        state["answer"] = response
+        state["decision"] = "direct"
+    return state
+
+def text_to_sql_node(state: State) -> State:
+    query = state["query"]
+    result = text_to_sql_tool.run(query)
+    state["answer"] = result
+    return state
+
+def rag_node(state: State) -> State:
+    query = state["query"]
+    result = rag_tool.run(query)
+    state["answer"] = result
+    return state
+
+# Define route function
+def route(state: State) -> str:
+    decision = state.get("decision", "")
+    if decision == "SQL":
+        return "text_to_sql"
+    elif decision == "RAG":
+        return "rag"
+    else:
+        return END
+
+# Build graph
+graph = StateGraph(State)
+graph.add_node("llm", llm_node)
+graph.add_node("text_to_sql", text_to_sql_node)
+graph.add_node("rag", rag_node)
+graph.set_entry_point("llm")
+graph.add_conditional_edges(
+    "llm",
+    route,
+    {
+        "text_to_sql": "text_to_sql",
+        "rag": "rag",
+        END: END
+    }
+)
+graph.add_edge("text_to_sql", END)
+graph.add_edge("rag", END)
+app = graph.compile()
+
+# Test the app
+if __name__ == "__main__":
+    queries = [
+        "How many employees are in the sales department?",
+        "Tell me about the company history.",
+        "What is the capital of France?",
+        "What is the meaning of life?",
+        "Hello, my name is Dinesh"
+    ]
+    for query in queries:
+        result = app.invoke({"query": query})
+        print(f"Query: {query}")
+        print(f"Answer: {result['answer']}\n")
