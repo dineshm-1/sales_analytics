@@ -1,0 +1,83 @@
+from confluent_kafka import Consumer, KafkaException, TopicPartition
+import sys
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def browse_kafka_topic(bootstrap_servers, topic, jaas_config, group_id, start_offset):
+    # Kafka consumer configuration
+    conf = {
+        'bootstrap.servers': bootstrap_servers,
+        'group.id': group_id,
+        'security.protocol': 'SASL_SSL',
+        'sasl.mechanism': 'PLAIN',
+        'sasl.jaas.config': jaas_config,
+        'auto.offset.reset': 'earliest',  # Fallback if offset is invalid
+        'enable.auto.commit': False,       # Disable auto-commit to avoid committing offsets
+        'session.timeout.ms': 6000,
+        'max.poll.records': 100
+    }
+
+    # Create consumer instance
+    consumer = Consumer(conf)
+
+    try:
+        # Get topic metadata to fetch partitions
+        metadata = consumer.list_topics(topic=topic, timeout=10)
+        if topic not in metadata.topics:
+            raise KafkaException(f"Topic {topic} does not exist")
+
+        partitions = metadata.topics[topic].partitions
+        logger.info(f"Found {len(partitions)} partitions for topic: {topic}")
+
+        # Assign partitions with specific offset
+        topic_partitions = [
+            TopicPartition(topic, partition_id, start_offset)
+            for partition_id in partitions
+        ]
+        consumer.assign(topic_partitions)
+        logger.info(f"Assigned partitions starting from offset: {start_offset}")
+
+        while True:
+            try:
+                # Poll for messages
+                msg = consumer.poll(timeout=1.0)
+                if msg is None:
+                    continue
+                if msg.error():
+                    logger.error(f"Consumer error: {msg.error()}")
+                    continue
+
+                # Print message details
+                print(f"Key: {msg.key().decode('utf-8') if msg.key() else 'None'}, "
+                      f"Value: {msg.value().decode('utf-8') if msg.value() else 'None'}, "
+                      f"Partition: {msg.partition()}, Offset: {msg.offset()}")
+
+            except KeyboardInterrupt:
+                logger.info("User interrupted. Closing consumer.")
+                break
+            except Exception as e:
+                logger.error(f"Error while consuming: {e}")
+
+    except KafkaException as e:
+        logger.error(f"Kafka error: {e}")
+    finally:
+        consumer.close()
+        logger.info("Consumer closed.")
+
+if __name__ == "__main__":
+    # Example configuration (replace with your values)
+    BOOTSTRAP_SERVERS = "your-bootstrap-servers:9092"  # e.g., 'kafka1:9092,kafka2:9092'
+    TOPIC = "your-topic-name"
+    GROUP_ID = "kafka-browser-group"
+    JAAS_CONFIG = (
+        'org.apache.kafka.common.security.plain.PlainLoginModule required '
+        'username="your-username" '
+        'password="your-password";'
+    )
+    START_OFFSET = 0  # Start from this offset for each partition
+
+    # Run the consumer
+    browse_kafka_topic(BOOTSTRAP_SERVERS, TOPIC, JAAS_CONFIG, GROUP_ID, START_OFFSET)
