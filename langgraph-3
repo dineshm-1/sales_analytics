@@ -311,6 +311,193 @@ class AgentState(TypedDict):
     # Optional Incident ID extracted or provided
     incident_id: Optional[str]
     # Details fetched from SQL Server
-    incident_details
+    incident_details: Optional[Dict[str, Any]]
+    # Results from RAG search
+    similar_incidents: Optional[List[Dict[str, Any]]]
+    # Intermediate messages or LLM calls
+    messages: Annotated[Sequence[BaseMessage], operator.add]
+    # Final generated response
+    final_response: str
+
+# --- LangGraph Nodes ---
+
+def start_node(state: AgentState) -> Dict[str, Any]:
+    """Initial node to prepare the input."""
+    print("\n--- Starting Workflow ---")
+    # Potentially extract incident ID from input_query here if needed
+    # For now, we assume incident_id might be passed directly or not needed initially
+    return {"messages": [HumanMessage(content=state["input_query"])]}
+
+def fetch_incident_details_node(state: AgentState) -> Dict[str, Any]:
+    """Calls the Incident Details Tool if an incident_id is present."""
+    print("\n--- Node: Fetch Incident Details ---")
+    incident_id = state.get("incident_id")
+    if incident_id:
+        print(f"Incident ID found: {incident_id}. Calling tool...")
+        details_str = incident_details_tool.invoke({"incident_id": incident_id})
+        try:
+            details_json = json.loads(details_str)
+            print(f"Tool Output (Parsed): {details_json}")
+            # Create a ToolMessage to record the call and result
+            tool_message = ToolMessage(content=details_str, tool_call_id="fetch_details_call") # ID is arbitrary here
+            return {"incident_details": details_json, "messages": [tool_message]}
+        except json.JSONDecodeError:
+            print(f"Error decoding JSON from incident_details_tool: {details_str}")
+            error_message = ToolMessage(content=json.dumps({"error": "Failed to parse details tool output."}), tool_call_id="fetch_details_call")
+            return {"incident_details": {"error": "Failed to parse tool output."}, "messages": [error_message]}
+    else:
+        print("No Incident ID provided. Skipping detail fetch.")
+        return {}
+
+def find_resolutions_node(state: AgentState) -> Dict[str, Any]:
+    """Calls the Incident Resolution Finder (RAG) tool."""
+    print("\n--- Node: Find Similar Resolutions (RAG) ---")
+    # Use the original query or fetched details as input for RAG
+    details = state.get("incident_details")
+    input_desc = ""
+    if details and not details.get("error") and details.get("Description"):
+         input_desc = details["Description"]
+         print(f"Using fetched description for RAG: '{input_desc[:100]}...'")
+    else:
+         input_desc = state["input_query"]
+         print(f"Using input query for RAG: '{input_desc[:100]}...'")
+
+    if not input_desc:
+        print("WARN: No description available for RAG search.")
+        return {"similar_incidents": {"error": "No description available for search."}}
+
+    rag_results_str = incident_resolution_finder.invoke({"incident_description": input_desc})
+    try:
+        rag_results_json = json.loads(rag_results_str)
+        print(f"RAG Tool Output (Parsed): {rag_results_json}")
+        tool_message = ToolMessage(content=rag_results_str, tool_call_id="find_resolutions_call")
+        return {"similar_incidents": rag_results_json, "messages": [tool_message]}
+    except json.JSONDecodeError:
+        print(f"Error decoding JSON from incident_resolution_finder: {rag_results_str}")
+        error_message = ToolMessage(content=json.dumps({"error": "Failed to parse RAG tool output."}), tool_call_id="find_resolutions_call")
+        return {"similar_incidents": {"error": "Failed to parse tool output."}, "messages": [error_message]}
+
+def generate_response_node(state: AgentState) -> Dict[str, Any]:
+    """Generates the final response using the custom LLM."""
+    print("\n--- Node: Generate Final Response ---")
+    current_incident_details = state.get("incident_details")
+    similar_incidents = state.get("similar_incidents")
+    user_query = state["input_query"]
+
+    # --- Build Context for the LLM ---
+    context_parts = []
+    context_parts.append(f"User Query: {user_query}")
+
+    if current_incident_details and not current_incident_details.get("error"):
+        context_parts.append("\nCurrent Incident Details:")
+        context_parts.append(json.dumps(current_incident_details, indent=2))
+    elif current_incident_details and current_incident_details.get("error"):
+         context_parts.append(f"\nError fetching current incident details: {current_incident_details.get('error')}")
+
+
+    if similar_incidents and isinstance(similar_incidents, list):
+        context_parts.append("\nSimilar Historical Incidents Found:")
+        for i, incident in enumerate(similar_incidents):
+            context_parts.append(f"\n--- Suggestion {i+1} (Similarity: {incident.get('similarity', 'N/A')}) ---")
+            context_parts.append(f"  Number: {incident.get('incident_number', 'N/A')}")
+            context_parts.append(f"  Details: {incident.get('incident_details', 'N/A')}")
+            context_parts.append(f"  Resolution: {incident.get('resolution_comments', 'N/A')}")
+    elif similar_incidents and similar_incidents.get("error"):
+         context_parts.append(f"\nError finding similar incidents: {similar_incidents.get('error')}")
+    elif similar_incidents and similar_incidents.get("message"):
+        context_parts.append(f"\nHistorical Search Result: {similar_incidents.get('message')}")
+
+
+    context = "\n".join(context_parts)
+
+    # --- Define the Prompt for the LLM ---
+    prompt = (
+        "You are an AI assistant helping with IT incident management.\n"
+        "Based on the user's query and the provided context (current incident details, similar historical incidents), "
+        "synthesize a helpful response. Summarize the situation and suggest potential resolution steps based on historical data.\n"
+        "If details were fetched, mention them. If similar incidents were found, highlight the most relevant resolutions.\n"
+        "If errors occurred during information retrieval, acknowledge them politely."
+    )
+
+    # Call the custom LLM
+    final_response = call_custom_llm(prompt=prompt, context=context)
+
+    return {"final_response": final_response}
+
+# --- Build LangGraph Workflow ---
+workflow = StateGraph(AgentState)
+
+# Add nodes
+workflow.add_node("start", start_node)
+workflow.add_node("fetch_details", fetch_incident_details_node)
+workflow.add_node("find_resolutions", find_resolutions_node)
+workflow.add_node("generate_response", generate_response_node)
+
+# Define edges
+workflow.set_entry_point("start")
+workflow.add_edge("start", "fetch_details") # Always try to fetch details first
+workflow.add_edge("fetch_details", "find_resolutions") # Then find similar incidents
+workflow.add_edge("find_resolutions", "generate_response") # Then generate the final summary
+workflow.add_edge("generate_response", END) # End the workflow
+
+# Compile the graph
+incident_management_app = workflow.compile()
+
+# --- Flask Routes ---
+@app.route('/')
+def index():
+    # Simple welcome page (optional)
+    return "Incident Management AI Assistant API"
+
+@app.route('/process_incident', methods=['POST'])
+@requires_auth # Apply basic authentication
+def process_incident():
+    """API endpoint to process an incident query."""
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+
+    data = request.get_json()
+    query = data.get('query')
+    incident_id = data.get('incident_id') # Optional incident ID
+
+    if not query:
+        return jsonify({"error": "Missing 'query' field in request"}), 400
+
+    print(f"\n--- Received API Request ---")
+    print(f"Query: {query}")
+    print(f"Incident ID: {incident_id}")
+
+    # Initial state for the LangGraph workflow
+    initial_state = {
+        "input_query": query,
+        "incident_id": incident_id,
+        "messages": [] # Start with empty messages
+    }
+
+    try:
+        # Invoke the LangGraph application
+        final_state = incident_management_app.invoke(initial_state, {"recursion_limit": 10}) # Add recursion limit
+
+        # Return the final response
+        return jsonify({
+            "query": query,
+            "incident_id": incident_id,
+            "response": final_state.get("final_response", "No response generated."),
+            # Optionally return intermediate state for debugging:
+            # "debug_details_fetched": final_state.get("incident_details"),
+            # "debug_similar_incidents": final_state.get("similar_incidents")
+        })
+
+    except Exception as e:
+        print(f"ERROR: LangGraph invocation failed: {e}")
+        # Consider logging the full traceback here
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Workflow execution failed: {e}"}), 500
+
+# --- Run Flask App ---
+if __name__ == '__main__':
+    # Make sure to set debug=False in production
+    app.run(debug=True, host='0.0.0.0', port=5001) # Run on port 5001, accessible externally
 
 
