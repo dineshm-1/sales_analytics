@@ -1,0 +1,316 @@
+# Basic Auth Credentials
+APP_USER=admin
+APP_PASSWORD=secret_password
+
+# SQL Server Connection (Windows Auth - Server and DB names)
+SQL_SERVER_NAME=YOUR_SQL_SERVER_INSTANCE_NAME
+SQL_DATABASE_NAME=YourIncidentDetailsDB
+SQL_TABLE_NAME=Incidents # Or your specific table name
+# Optional: Driver name if not the default
+# SQL_DRIVER='{ODBC Driver 17 for SQL Server}'
+
+# PostgreSQL Connection
+PG_HOST=localhost
+PG_PORT=5432
+PG_DATABASE=incident_history_db
+PG_USER=your_pg_user
+PG_PASSWORD=your_pg_password
+PG_TABLE_NAME=incident_history
+
+# Custom LLM API Endpoint (Example)
+CUSTOM_LLM_ENDPOINT=http://localhost:5000/generate # Replace with your actual endpoint
+# Add any necessary API keys if your LLM requires them
+# CUSTOM_LLM_API_KEY=your_llm_api_key
+
+
+#app.py
+
+import os
+import functools
+import json
+from typing import TypedDict, Annotated, Sequence, Optional, Dict, Any
+import operator
+
+# --- Database & Web ---
+import flask
+from flask import request, jsonify, Response
+import pyodbc
+import psycopg2
+from psycopg2.extras import RealDictCursor
+# from pgvector.psycopg2 import register_vector # Uncomment if using pgvector extension
+
+# --- AI & Embeddings ---
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
+from langchain_core.tools import tool
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import requests # To call the custom LLM API
+
+# --- LangGraph ---
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode # If using Langchain Tool format
+
+# --- Environment Variables ---
+from dotenv import load_dotenv
+load_dotenv()
+
+# --- Configuration ---
+APP_USER = os.getenv("APP_USER", "admin")
+APP_PASSWORD = os.getenv("APP_PASSWORD", "password")
+
+# SQL Server Config
+SQL_SERVER = os.getenv("SQL_SERVER_NAME")
+SQL_DATABASE = os.getenv("SQL_DATABASE_NAME")
+SQL_INCIDENT_TABLE = os.getenv("SQL_TABLE_NAME", "Incidents")
+SQL_DRIVER = os.getenv("SQL_DRIVER", "{ODBC Driver 17 for SQL Server}") # Adjust driver if needed
+
+# PostgreSQL Config
+PG_HOST = os.getenv("PG_HOST")
+PG_PORT = os.getenv("PG_PORT")
+PG_DATABASE = os.getenv("PG_DATABASE")
+PG_USER = os.getenv("PG_USER")
+PG_PASSWORD = os.getenv("PG_PASSWORD")
+PG_HISTORY_TABLE = os.getenv("PG_TABLE_NAME", "incident_history")
+
+# Custom LLM Config
+CUSTOM_LLM_ENDPOINT = os.getenv("CUSTOM_LLM_ENDPOINT")
+# CUSTOM_LLM_API_KEY = os.getenv("CUSTOM_LLM_API_KEY") # If needed
+
+# --- Embedding Model ---
+# Load a sentence transformer model for embeddings
+# Ensure this matches the model used to populate the 'embeddings' column in Postgres
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+embedding_dim = embedding_model.get_sentence_embedding_dimension()
+print(f"Embedding Dimension: {embedding_dim}")
+
+# --- Flask App Setup ---
+app = flask.Flask(__name__)
+
+# --- Basic Authentication ---
+def check_auth(username, password):
+    """Check if a username/password combination is valid."""
+    return username == APP_USER and password == APP_PASSWORD
+
+def authenticate():
+    """Sends a 401 response that enables basic auth."""
+    return Response(
+        'Could not verify your access level for that URL.\n'
+        'You have to login with proper credentials', 401,
+        {'WWW-Authenticate': 'Basic realm="Login Required"'})
+
+def requires_auth(f):
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return f(*args, **kwargs)
+    return decorated
+
+# --- Custom LLM Interface ---
+def call_custom_llm(prompt: str, context: Optional[str] = None) -> str:
+    """
+    Placeholder function to call your custom LLM.
+    Replace this with the actual API call or library usage for your LLM.
+    """
+    print(f"\n--- Calling Custom LLM ---")
+    full_prompt = prompt
+    if context:
+        full_prompt = f"Context:\n{context}\n\nPrompt:\n{prompt}"
+
+    print(f"Prompt sent to LLM:\n{full_prompt}\n---")
+
+    if not CUSTOM_LLM_ENDPOINT:
+        print("WARNING: CUSTOM_LLM_ENDPOINT not set. Returning placeholder response.")
+        return "Placeholder LLM response: Could not connect to LLM."
+
+    try:
+        # Example for a simple JSON API endpoint
+        payload = {"prompt": full_prompt}
+        headers = {"Content-Type": "application/json"}
+        # Add Authorization header if needed:
+        # headers["Authorization"] = f"Bearer {CUSTOM_LLM_API_KEY}"
+
+        response = requests.post(CUSTOM_LLM_ENDPOINT, json=payload, headers=headers, timeout=60)
+        response.raise_for_status() # Raise an exception for bad status codes
+
+        # --- Adjust based on your LLM's response format ---
+        # Example 1: Simple text response
+        # llm_response = response.text
+
+        # Example 2: JSON response with a specific key
+        llm_response = response.json().get("generated_text", "LLM response format not recognized.")
+        # ----------------------------------------------------
+
+        print(f"LLM Response: {llm_response}")
+        return llm_response
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error calling Custom LLM: {e}")
+        return f"Error: Could not get response from LLM. Details: {e}"
+    except json.JSONDecodeError:
+         print(f"Error decoding LLM JSON response. Raw response: {response.text}")
+         return f"Error: Could not parse LLM response. Raw: {response.text}"
+
+# --- Embedding Function ---
+def get_embedding(text: str) -> np.ndarray:
+    """Generates embedding for the given text."""
+    return embedding_model.encode(text)
+
+# --- Custom Tools ---
+
+@tool("incident_details_tool")
+def incident_details_tool(incident_id: str) -> str:
+    """
+    Connects to the SQL Server database using Windows Authentication
+    and retrieves details for a specific incident ID.
+    """
+    print(f"\n--- Running Incident Details Tool ---")
+    print(f"Fetching details for Incident ID: {incident_id}")
+    conn_str = (
+        f'DRIVER={SQL_DRIVER};'
+        f'SERVER={SQL_SERVER};'
+        f'DATABASE={SQL_DATABASE};'
+        f'Trusted_Connection=yes;' # Key for Windows Authentication
+    )
+    details = {}
+    try:
+        with pyodbc.connect(conn_str, timeout=5) as conn:
+            with conn.cursor() as cursor:
+                # IMPORTANT: Adjust the query, table name, and column names
+                query = f"SELECT IncidentNumber, Description, Status, Priority, ReportedTime FROM {SQL_INCIDENT_TABLE} WHERE IncidentID = ?"
+                print(f"Executing SQL Query: {query} with param: {incident_id}")
+                cursor.execute(query, incident_id)
+                row = cursor.fetchone()
+                if row:
+                    # Assuming column names are as specified in the query
+                    columns = [column[0] for column in cursor.description]
+                    details = dict(zip(columns, row))
+                    print(f"Details Found: {details}")
+                    return json.dumps(details) # Return details as a JSON string
+                else:
+                    print("Incident ID not found.")
+                    return json.dumps({"error": f"Incident ID '{incident_id}' not found in {SQL_DATABASE}."})
+    except pyodbc.Error as ex:
+        sqlstate = ex.args[0]
+        error_message = f"SQL Server connection or query failed. SQLSTATE: {sqlstate}. Error: {ex}"
+        print(f"ERROR: {error_message}")
+        return json.dumps({"error": error_message})
+    except Exception as e:
+        error_message = f"An unexpected error occurred in incident_details_tool: {e}"
+        print(f"ERROR: {error_message}")
+        return json.dumps({"error": error_message})
+
+@tool("incident_resolution_finder")
+def incident_resolution_finder(incident_description: str, top_k: int = 3) -> str:
+    """
+    Finds similar historical incidents in PostgreSQL using vector embeddings (RAG)
+    and returns their details and resolutions.
+    """
+    print(f"\n--- Running Incident Resolution Finder (RAG) ---")
+    print(f"Finding similar incidents for description: '{incident_description[:100]}...'")
+    try:
+        # 1. Generate embedding for the input description
+        query_embedding = get_embedding(incident_description)
+
+        # 2. Connect to PostgreSQL
+        conn_pg = psycopg2.connect(
+            host=PG_HOST,
+            port=PG_PORT,
+            database=PG_DATABASE,
+            user=PG_USER,
+            password=PG_PASSWORD
+        )
+        # register_vector(conn_pg) # Uncomment if using pgvector extension
+
+        cur = conn_pg.cursor(cursor_factory=RealDictCursor) # Get results as dicts
+
+        # 3. Perform Similarity Search
+        # IMPORTANT: This query assumes you are using the pgvector extension
+        # and its cosine distance operator (<=>). Adjust if using a different method.
+        # Ensure the 'embeddings' column is indexed for performance.
+        query = f"""
+            SELECT
+                id,
+                incident_number,
+                incident_details,
+                resolution_comments,
+                1 - (embeddings <=> %s::vector) AS similarity
+            FROM {PG_HISTORY_TABLE}
+            ORDER BY similarity DESC
+            LIMIT %s
+        """
+        params = (query_embedding.tolist(), top_k)
+
+        # --- Alternative if NOT using pgvector (less efficient) ---
+        # Fetch all embeddings and calculate similarity in Python
+        # query = f"SELECT id, incident_number, incident_details, resolution_comments, embeddings FROM {PG_HISTORY_TABLE}"
+        # cur.execute(query)
+        # all_incidents = cur.fetchall()
+        # similarities = []
+        # for incident in all_incidents:
+        #     # Assuming embeddings are stored as lists/arrays convertible to numpy
+        #     db_embedding = np.array(incident['embeddings'])
+        #     # Calculate cosine similarity
+        #     sim = np.dot(query_embedding, db_embedding) / (np.linalg.norm(query_embedding) * np.linalg.norm(db_embedding))
+        #     similarities.append({'similarity': sim, **incident})
+        # # Sort by similarity and take top_k
+        # similar_incidents = sorted(similarities, key=lambda x: x['similarity'], reverse=True)[:top_k]
+        # params = None # Clear params if using Python calculation
+        # ------------------------------------------------------------
+
+        print(f"Executing RAG Query on PostgreSQL...")
+        if params:
+            cur.execute(query, params)
+            similar_incidents = cur.fetchall()
+        else:
+            # This branch is for the Python calculation alternative (already computed)
+            pass
+
+        cur.close()
+        conn_pg.close()
+
+        if not similar_incidents:
+            print("No similar incidents found.")
+            return json.dumps({"message": "No similar historical incidents found."})
+
+        # 4. Format results
+        print(f"Found {len(similar_incidents)} similar incidents.")
+        results = []
+        for incident in similar_incidents:
+             # Ensure numpy floats are converted for JSON serialization
+             similarity_score = float(incident['similarity']) if 'similarity' in incident else None
+             results.append({
+                 "id": incident['id'],
+                 "incident_number": incident.get('incident_number', 'N/A'),
+                 "incident_details": incident.get('incident_details', 'N/A'),
+                 "resolution_comments": incident.get('resolution_comments', 'N/A'),
+                 "similarity": f"{similarity_score:.4f}" if similarity_score is not None else "N/A"
+             })
+
+        return json.dumps(results) # Return results as JSON string
+
+    except psycopg2.Error as e:
+        error_message = f"PostgreSQL connection or query failed: {e}"
+        print(f"ERROR: {error_message}")
+        return json.dumps({"error": error_message})
+    except ImportError:
+        error_message = "pgvector not installed or failed to import. Cannot perform vector search directly in DB. Install 'pgvector'."
+        print(f"ERROR: {error_message}")
+        return json.dumps({"error": error_message})
+    except Exception as e:
+        error_message = f"An unexpected error occurred in incident_resolution_finder: {e}"
+        print(f"ERROR: {error_message}")
+        return json.dumps({"error": error_message})
+
+# --- LangGraph State Definition ---
+
+class AgentState(TypedDict):
+    # Input query from the user
+    input_query: str
+    # Optional Incident ID extracted or provided
+    incident_id: Optional[str]
+    # Details fetched from SQL Server
+    incident_details
+
+
