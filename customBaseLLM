@@ -1,193 +1,104 @@
-from typing import Any, Dict, List, Mapping, Optional, Union
-from langchain_core.callbacks import CallbackManagerForLLMRun
-from langchain_core.language_models.llms import LLM
-from langchain_core.tools import BaseTool
-import requests
-import json
 import base64
+import requests
+from typing import Any, Dict, List, Optional
+from langchain_core.language_models import BaseLanguageModel
+from langchain_core.outputs import Generation, LLMResult
+from langchain_core.tools import BaseTool
+from pydantic import BaseModel, Field
 
-class CustomLLMWrapper(LLM):
-    """Wrapper around a custom LLM service with basic authentication.
-    
-    This wrapper provides:
-    1. API Key + Basic Authentication
-    2. Tool binding capability
-    3. Standard LangChain LLM interface integration
-    """
-    
-    # Required LLM configuration parameters
-    api_base_url: str
-    api_key: Optional[str] = None
-    username: Optional[str] = None
-    password: Optional[str] = None
-    request_timeout: int = 30
-    model_name: str = "default-model"
-    
-    # Tool binding related attributes
-    _tools: List[BaseTool] = []
-    _tool_choice: Optional[str] = None
-    
-    @property
-    def _llm_type(self) -> str:
-        """Return type of LLM."""
-        return "custom_llm"
-    
-    def _prepare_headers(self) -> Dict[str, str]:
-        """Prepare authentication headers for API request."""
-        headers = {
+class CustomLLMConfig(BaseModel):
+    endpoint: str = Field(..., description="API endpoint for the LLM")
+    username: str = Field(..., description="Username for basic authentication")
+    password: str = Field(..., description="Password for basic authentication")
+
+class CustomLLM(BaseLanguageModel):
+    config: CustomLLMConfig
+    tools: List[Any] = []
+
+    def __init__(self, endpoint: str, username: str, password: str):
+        super().__init__(config=CustomLLMConfig(endpoint=endpoint, username=username, password=password))
+        self.tools = []
+
+    def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs) -> str:
+        """
+        Synchronous call to the LLM API.
+        """
+        headers = self._get_auth_headers()
+        payload = {
+            "prompt": prompt,
+            "tools": self._get_tool_schemas() if self.tools else None
+        }
+        if stop:
+            payload["stop"] = stop
+
+        try:
+            response = requests.post(self.config.endpoint, json=payload, headers=headers)
+            response.raise_for_status()
+            return response.json().get("text", "")
+        except requests.RequestException as e:
+            raise ValueError(f"API call failed: {str(e)}")
+
+    def _generate(self, prompts: List[str], stop: Optional[List[str]] = None, **kwargs) -> LLMResult:
+        """
+        Generate responses for multiple prompts.
+        """
+        generations = []
+        for prompt in prompts:
+            text = self._call(prompt, stop=stop, **kwargs)
+            generations.append([Generation(text=text)])
+        return LLMResult(generations=generations)
+
+    async def _agenerate(self, prompts: List[str], stop: Optional[List[str]] = None, **kwargs) -> LLMResult:
+        """
+        Asynchronous generation (simulated here using synchronous call for simplicity).
+        """
+        return self._generate(prompts, stop=stop, **kwargs)
+
+    def bind_tools(self, tools: List[Any], **kwargs) -> 'CustomLLM':
+        """
+        Bind tools to the LLM, enabling tool usage in agent workflows.
+        Args:
+            tools: List of tools (BaseTool instances or function schemas).
+            **kwargs: Additional arguments for tool binding.
+        Returns:
+            Self for method chaining.
+        """
+        self.tools = tools
+        return self
+
+    def _get_auth_headers(self) -> Dict[str, str]:
+        """
+        Generate basic authentication headers.
+        """
+        credentials = f"{self.config.username}:{self.config.password}"
+        auth_header = f"Basic {base64.b64encode(credentials.encode()).decode()}"
+        return {
+            "Authorization": auth_header,
             "Content-Type": "application/json"
         }
-        
-        # Add API key authentication if provided
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        
-        # Add Basic authentication if username and password are provided
-        if self.username and self.password:
-            auth_string = f"{self.username}:{self.password}"
-            auth_bytes = auth_string.encode('ascii')
-            base64_auth = base64.b64encode(auth_bytes).decode('ascii')
-            headers["Authorization"] = f"Basic {base64_auth}"
-            
-        return headers
-    
-    def _prepare_request_body(self, prompt: str) -> Dict[str, Any]:
-        """Prepare the request body with prompt and optional tools."""
-        request_body = {
-            "model": self.model_name,
-            "prompt": prompt,
-        }
-        
-        # Add tools if they exist
-        if self._tools:
-            tools_data = []
-            for tool in self._tools:
-                tools_data.append({
+
+    def _get_tool_schemas(self) -> List[Dict[str, Any]]:
+        """
+        Convert bound tools to API-compatible schemas.
+        """
+        schemas = []
+        for tool in self.tools:
+            if isinstance(tool, BaseTool):
+                schema = {
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": getattr(tool, "args_schema", {}),
-                })
-            
-            request_body["tools"] = tools_data
-            
-            # Add tool_choice if specified
-            if self._tool_choice:
-                request_body["tool_choice"] = self._tool_choice
-                
-        return request_body
-    
-    def _call(
-        self,
-        prompt: str,
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerForLLMRun] = None,
-        **kwargs: Any,
-    ) -> str:
-        """Call the custom LLM service with the provided prompt."""
-        headers = self._prepare_headers()
-        request_body = self._prepare_request_body(prompt)
-        
-        # Add stop sequences if provided
-        if stop:
-            request_body["stop"] = stop
-            
-        # Add any additional kwargs
-        for key, value in kwargs.items():
-            request_body[key] = value
-            
-        # Make the API call
-        try:
-            response = requests.post(
-                f"{self.api_base_url}/completions",
-                headers=headers,
-                json=request_body,
-                timeout=self.request_timeout
-            )
-            response.raise_for_status()
-            
-            # Parse the response
-            result = response.json()
-            
-            # Extract the completion text from the response
-            # Adapt this based on your API's response structure
-            return result.get("choices", [{}])[0].get("text", "")
-            
-        except requests.exceptions.RequestException as e:
-            raise ValueError(f"Error calling LLM API: {str(e)}")
-    
-    def bind_tools(self, tools: List[BaseTool], tool_choice: Optional[str] = None) -> "CustomLLMWrapper":
-        """Bind tools to the LLM for function calling capabilities.
-        
-        Args:
-            tools: A list of LangChain tools to bind to the LLM
-            tool_choice: Optional specification for tool selection strategy
-                         (e.g., "auto", "required", or specific tool name)
-                         
-        Returns:
-            Self instance for method chaining
-        """
-        self._tools = tools
-        self._tool_choice = tool_choice
-        return self
-        
+                    "parameters": tool.args_schema.schema() if tool.args_schema else {}
+                }
+            elif isinstance(tool, dict):
+                schema = tool  # Assume dict is already in correct schema format
+            else:
+                raise ValueError(f"Unsupported tool type: {type(tool)}")
+            schemas.append(schema)
+        return schemas
+
     @property
-    def _identifying_params(self) -> Mapping[str, Any]:
-        """Get the identifying parameters."""
-        return {
-            "api_base_url": self.api_base_url,
-            "model_name": self.model_name,
-            "has_api_key": self.api_key is not None,
-            "has_basic_auth": self.username is not None and self.password is not None,
-            "tools_count": len(self._tools),
-            "tool_choice": self._tool_choice,
-        }
-
-
-# Example usage
-if __name__ == "__main__":
-    # Initialize the custom LLM wrapper
-    llm = CustomLLMWrapper(
-        api_base_url="https://api.your-llm-service.com",
-        api_key="your-api-key",  # API key authentication
-        # Or use Basic authentication
-        # username="your-username", 
-        # password="your-password",
-        model_name="your-model-name",
-        request_timeout=60,
-    )
-    
-    # Create some example tools
-    from langchain_core.tools import Tool
-    
-    calculator_tool = Tool(
-        name="calculator",
-        description="Useful for performing mathematical calculations",
-        func=lambda x: eval(x),
-    )
-    
-    weather_tool = Tool(
-        name="get_weather",
-        description="Get the current weather for a location",
-        func=lambda location: f"Weather data for {location}: Sunny, 72°F",
-    )
-    
-    # Bind the tools to the LLM
-    llm_with_tools = llm.bind_tools(
-        tools=[calculator_tool, weather_tool],
-        tool_choice="auto"  # Let the model decide when to use tools
-    )
-    
-    # Use the LLM in a chain
-    from langchain_core.prompts import PromptTemplate
-    from langchain.chains import LLMChain
-    
-    prompt = PromptTemplate(
-        input_variables=["query"],
-        template="Answer the following query: {query}",
-    )
-    
-    chain = LLMChain(llm=llm_with_tools, prompt=prompt)
-    
-    # Run the chain
-    result = chain.run("What's 24 * 7?")
-    print(result)
+    def _llm_type(self) -> str:
+        """
+        Identify the LLM type for LangChain.
+        """
+        return "custom_llm"
