@@ -1,0 +1,102 @@
+import ibm_db
+from langchain.prompts import PromptTemplate
+from langchain.llms import HuggingFacePipeline
+from langchain.chains import LLMChain
+from transformers import pipeline
+
+# Initialize the Text-to-SQL model (Hugging Face T5 for simplicity)
+text2sql_model = pipeline("text2sql", model="t5-base", tokenizer="t5-base")
+llm = HuggingFacePipeline(pipeline=text2sql_model)
+
+# LangChain Prompt Template for Text-to-SQL
+prompt_template = PromptTemplate(
+    input_variables=["query", "schema"],
+    template="""
+    Given the following database schema:
+    {schema}
+
+    Convert the following natural language query to SQL:
+    {query}
+    
+    Return only the SQL query.
+    """
+)
+
+# Sample schema (for the DB2 SAMPLE database)
+schema = """
+Table: EMPLOYEE
+Columns: EMPNO (CHAR), FIRSTNME (VARCHAR), LASTNAME (VARCHAR), DEPTNO (CHAR)
+
+Table: DEPARTMENT
+Columns: DEPTNO (CHAR), DEPTNAME (VARCHAR)
+"""
+
+# Create LangChain LLMChain
+text2sql_chain = LLMChain(llm=llm, prompt=prompt_template)
+
+# DB2 Connection Details
+db2_dsn = (
+    "DRIVER={{IBM DB2 ODBC DRIVER}};"
+    "DATABASE=SAMPLE;"
+    "HOSTNAME=your_hostname;"
+    "PORT=50000;"
+    "PROTOCOL=TCPIP;"
+    "UID=your_username;"
+    "PWD=your_password;"
+)
+
+# Function to connect to DB2
+def connect_db2():
+    try:
+        conn = ibm_db.connect(db2_dsn, "", "")
+        print("Connected to DB2")
+        return conn
+    except Exception as e:
+        print(f"Error connecting to DB2: {str(e)}")
+        return None
+
+# Function to execute SQL query
+def execute_query(conn, sql_query):
+    try:
+        stmt = ibm_db.exec_immediate(conn, sql_query)
+        result = []
+        while ibm_db.fetch_row(stmt):
+            row = [ibm_db.result(stmt, i) for i in range(ibm_db.num_fields(stmt))]
+            result.append(row)
+        return result
+    except Exception as e:
+        print(f"Error executing query: {str(e)}")
+        return None
+
+# Function to convert text to SQL and execute using LangChain
+def text_to_sql_rag(natural_language_query):
+    # Generate SQL query using LangChain
+    sql_query = text2sql_chain.run(query=natural_language_query, schema=schema).strip()
+    print(f"Generated SQL: {sql_query}")
+
+    # Connect to DB2
+    conn = connect_db2()
+    if not conn:
+        return None
+
+    # Execute the SQL query
+    results = execute_query(conn, sql_query)
+
+    # Close connection
+    ibm_db.close(conn)
+    return results
+
+# Example usage
+if __name__ == "__main__":
+    # Example natural language query
+    query = "Show me all employees in the department with ID 10"
+    
+    # Run the Text-to-SQL RAG
+    results = text_to_sql_rag(query)
+    
+    # Display results
+    if results:
+        for row in results:
+            print(row)
+    else:
+        print("No results or an error occurred.")
