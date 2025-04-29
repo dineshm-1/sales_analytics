@@ -1,0 +1,221 @@
+import os
+import ibm_db
+from langchain.llms import OpenAI
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+from dotenv import load_dotenv
+import json
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, Optional
+import uuid
+
+# Load environment variables
+load_dotenv()
+
+# DB2 connection details from environment variables
+DB2_DSN = os.getenv("DB2_DSN", "DATABASE=your_db;HOSTNAME=your_host;PORT=your_port;PROTOCOL=TCPIP;UID=your_user;PWD=your_pass")
+
+# Data dictionary: Maps technical column names to logical names
+DATA_DICTIONARY = {
+    "CUSTOMERS": {
+        "CUST_ID": "Customer ID",
+        "CUST_NAME": "Customer Name",
+        "CUST_EMAIL": "Email",
+        "CUST_PHONE": "Phone Number"
+    },
+    "ORDERS": {
+        "ORDER_ID": "Order ID",
+        "CUST_ID": "Customer ID",
+        "ORDER_DATE": "Order Date",
+        "TOTAL_AMOUNT": "Total Amount"
+    },
+    "PRODUCTS": {
+        "PROD_ID": "Product ID",
+        "PROD_NAME": "Product Name",
+        "UNIT_PRICE": "Price",
+        "STOCK_QTY": "Stock Quantity"
+    }
+}
+
+# Initialize language model
+llm = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), model_name="gpt-3.5-turbo")
+
+# Prompt templates
+SQL_PROMPT = PromptTemplate(
+    input_variables=["query", "data_dictionary", "feedback"],
+    template="""
+    You are a SQL expert for a DB2 database. Using the provided data dictionary, translate the natural language query into a valid SQL query. If feedback from a review agent is provided, incorporate it to fix issues.
+
+    Data dictionary: {data_dictionary}
+    Natural language query: {query}
+    Review feedback (if any): {feedback}
+
+    Instructions:
+    - Use the data dictionary to identify correct table and column names.
+    - Generate a syntactically correct SQL query for DB2.
+    - If feedback is provided, address the issues mentioned.
+    - Include appropriate JOINs for multi-table queries.
+    - Return only the SQL query.
+
+    SQL Query:
+    """
+)
+
+REVIEW_PROMPT = PromptTemplate(
+    input_variables=["sql_query", "data_dictionary"],
+    template="""
+    You are a SQL review agent. Validate the provided SQL query against the data dictionary to ensure correctness for a DB2 database.
+
+    SQL query: {sql_query}
+    Data dictionary: {data_dictionary}
+
+    Instructions:
+    - Check if table and column names exist in the data dictionary.
+    - Verify JOINs are logical and use correct keys.
+    - Ensure syntax is valid for DB2.
+    - If issues are found, provide specific feedback on what needs fixing.
+    - If the query is correct, return "Query is valid."
+
+    Feedback:
+    """
+)
+
+RESPONSE_PROMPT = PromptTemplate(
+    input_variables=["query", "results"],
+    template="""
+    You are a helpful assistant. Based on the user's query and database results, provide a natural language response that summarizes the findings conversationally.
+
+    User query: {query}
+    Database results: {results}
+
+    Response:
+    """
+)
+
+# Initialize LLM chains
+sql_chain = LLMChain(llm=llm, prompt=SQL_PROMPT)
+review_chain = LLMChain(llm=llm, prompt=REVIEW_PROMPT)
+response_chain = LLMChain(llm=llm, prompt=RESPONSE_PROMPT)
+
+# State for LangGraph
+class GraphState(TypedDict):
+    query: str
+    sql_query: Optional[str]
+    feedback: Optional[str]
+    results: Optional[list]
+    error: Optional[str]
+    retries: int
+    max_retries: int
+
+# Function to connect to DB2 database
+def connect_db2():
+    try:
+        conn = ibm_db.connect(DB2_DSN, "", "")
+        return conn, None
+    except Exception as e:
+        return None, f"Error connecting to DB2: {str(e)}"
+
+# Function to execute SQL query
+def execute_query(conn, sql_query):
+    try:
+        stmt = ibm_db.exec_immediate(conn, sql_query)
+        results = []
+        while ibm_db.fetch_row(stmt):
+            row = {ibm_db.field_name(stmt, i): ibm_db.result(stmt, i) for i in range(ibm_db.num_fields(stmt))}
+            results.append(row)
+        return results, None
+    except Exception as e:
+        return None, f"Error executing query: {str(e)}"
+
+# Nodes for LangGraph
+def generate_sql(state: GraphState) -> GraphState:
+    data_dict_str = json.dumps(DATA_DICTIONARY, indent=2)
+    sql_query = sql_chain.run(
+        query=state["query"],
+        data_dictionary=data_dict_str,
+        feedback=state.get("feedback", "")
+    ).strip()
+    return {"sql_query": sql_query, "retries": state["retries"]}
+
+def review_sql(state: GraphState) -> GraphState:
+    data_dict_str = json.dumps(DATA_DICTIONARY, indent=2)
+    feedback = review_chain.run(
+        sql_query=state["sql_query"],
+        data_dictionary=data_dict_str
+    ).strip()
+    return {"feedback": feedback}
+
+def execute_sql(state: GraphState) -> GraphState:
+    conn, conn_error = connect_db2()
+    if conn_error:
+        return {"error": conn_error, "retries": state["retries"] + 1}
+
+    results, query_error = execute_query(conn, state["sql_query"])
+    ibm_db.close(conn)
+
+    if query_error:
+        return {"error": query_error, "retries": state["retries"] + 1}
+    return {"results": results, "retries": state["retries"]}
+
+def generate_response(state: GraphState) -> GraphState:
+    results_str = json.dumps(state["results"], indent=2) if state["results"] else "No results found."
+    response = response_chain.run(query=state["query"], results=results_str).strip()
+    return {"error": response}
+
+# Conditional edge to decide next step
+def decide_next_step(state: GraphState) -> str:
+    if state.get("error") and state["retries"] < state["max_retries"]:
+        if state.get("feedback") != "Query is valid":
+            return "review_sql"
+        return "generate_sql"
+    if state.get("results") is not None:
+        return "generate_response"
+    return "end"
+
+# Build LangGraph workflow
+workflow = StateGraph(GraphState)
+
+workflow.add_node("generate_sql", generate_sql)
+workflow.add_node("review_sql", review_sql)
+workflow.add_node("execute_sql", execute_sql)
+workflow.add_node("generate_response", generate_response)
+
+workflow.add_edge("generate_sql", "review_sql")
+workflow.add_edge("review_sql", "execute_sql")
+workflow.add_edge("execute_sql", "decide_next_step")
+workflow.add_edge("generate_response", "end")
+
+workflow.add_conditional_edges(
+    "decide_next_step",
+    decide_next_step,
+    {
+        "generate_sql": "generate_sql",
+        "review_sql": "review_sql",
+        "generate_response": "generate_response",
+        "end": END
+    }
+)
+
+workflow.set_entry_point("generate_sql")
+app = workflow.compile()
+
+# Main function to process natural language query
+def process_query(natural_query: str) -> str:
+    initial_state = {
+        "query": natural_query,
+        "sql_query": None,
+        "feedback": "",
+        "results": None,
+        "error": None,
+        "retries": 0,
+        "max_retries": 3
+    }
+    result = app.invoke(initial_state)
+    return result.get("error", "Failed to process query after maximum retries.")
+
+# Example usage
+if __name__ == "__main__":
+    query = "Show me all customers who placed orders with a total amount greater than 1000."
+    response = process_query(query)
+    print(f"Query: {query}")
+    print(f"Response: {response}")
