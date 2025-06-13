@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""
+Kafka Consumer with JAAS configuration and Keytab authentication
+Requires: kafka-python (uses JVM's built-in GSSAPI, no additional libraries needed)
+"""
+
+import os
+import logging
+from kafka import KafkaConsumer
+from kafka.errors import KafkaError
+import json
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class SecureKafkaConsumer:
+    def __init__(self, config):
+        self.config = config
+        self.consumer = None
+        self.setup_jaas_config()
+    
+    def setup_jaas_config(self):
+        """Setup JAAS configuration for Kerberos authentication"""
+        jaas_config = f"""
+        KafkaClient {{
+            com.sun.security.auth.module.Krb5LoginModule required
+            useKeyTab=true
+            storeKey=true
+            keyTab="{self.config['keytab_path']}"
+            principal="{self.config['principal']}"
+            useTicketCache=false
+            renewTicket=true
+            serviceName="kafka";
+        }};
+        """
+        
+        # Write JAAS config to temporary file
+        jaas_file_path = "/tmp/kafka_client_jaas.conf"
+        with open(jaas_file_path, 'w') as f:
+            f.write(jaas_config)
+        
+        # Set environment variables for Kerberos configuration
+        os.environ['KAFKA_OPTS'] = f'-Djava.security.auth.login.config={jaas_file_path}'
+        
+        # Additional JVM options for Kerberos (helpful for debugging)
+        if self.config.get('debug_kerberos', False):
+            os.environ['KAFKA_OPTS'] += ' -Dsun.security.krb5.debug=true'
+        
+        # Set krb5.conf path if specified
+        if self.config.get('krb5_conf_path'):
+            os.environ['KAFKA_OPTS'] += f' -Djava.security.krb5.conf={self.config["krb5_conf_path"]}'
+        
+        logger.info(f"JAAS configuration written to {jaas_file_path}")
+        logger.info(f"KAFKA_OPTS: {os.environ.get('KAFKA_OPTS')}")
+    
+    def create_consumer(self):
+        """Create and configure Kafka consumer with security settings"""
+        try:
+            consumer_config = {
+                'bootstrap_servers': self.config['bootstrap_servers'],
+                'group_id': self.config['group_id'],
+                'auto_offset_reset': self.config.get('auto_offset_reset', 'earliest'),
+                'enable_auto_commit': self.config.get('enable_auto_commit', True),
+                'auto_commit_interval_ms': self.config.get('auto_commit_interval_ms', 1000),
+                'value_deserializer': lambda x: x.decode('utf-8') if x else None,
+                'key_deserializer': lambda x: x.decode('utf-8') if x else None,
+                
+                # Security configuration for Kerberos (no SSL)
+                'security_protocol': 'SASL_PLAINTEXT',
+                'sasl_mechanism': 'GSSAPI',
+                'sasl_kerberos_service_name': self.config.get('sasl_kerberos_service_name', 'kafka'),
+                
+                # Additional SASL options
+                'sasl_kerberos_domain_name': self.config.get('sasl_kerberos_domain_name'),
+                
+                # SSL configuration removed - using SASL_PLAINTEXT
+                # 'ssl_check_hostname': False,
+                # 'ssl_cafile': self.config.get('ssl_cafile'),
+                # 'ssl_certfile': self.config.get('ssl_certfile'),
+                # 'ssl_keyfile': self.config.get('ssl_keyfile'),
+            }
+            
+            # Remove None values
+            consumer_config = {k: v for k, v in consumer_config.items() if v is not None}
+            
+            self.consumer = KafkaConsumer(**consumer_config)
+            logger.info("Kafka consumer created successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to create Kafka consumer: {e}")
+            raise
+    
+    def subscribe_and_consume(self, topics):
+        """Subscribe to topics and start consuming messages"""
+        if not self.consumer:
+            self.create_consumer()
+        
+        try:
+            # Subscribe to topics
+            self.consumer.subscribe(topics)
+            logger.info(f"Subscribed to topics: {topics}")
+            
+            # Start consuming messages
+            logger.info("Starting message consumption...")
+            for message in self.consumer:
+                self.process_message(message)
+                
+        except KeyboardInterrupt:
+            logger.info("Consumer interrupted by user")
+        except KafkaError as e:
+            logger.error(f"Kafka error occurred: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+        finally:
+            self.cleanup()
+    
+    def process_message(self, message):
+        """Process individual message"""
+        try:
+            logger.info(f"Received message:")
+            logger.info(f"  Topic: {message.topic}")
+            logger.info(f"  Partition: {message.partition}")
+            logger.info(f"  Offset: {message.offset}")
+            logger.info(f"  Key: {message.key}")
+            logger.info(f"  Value: {message.value}")
+            logger.info(f"  Timestamp: {message.timestamp}")
+            
+            # Add your message processing logic here
+            # For example, parse JSON messages:
+            if message.value:
+                try:
+                    data = json.loads(message.value)
+                    logger.info(f"  Parsed JSON: {data}")
+                except json.JSONDecodeError:
+                    logger.info("  Message is not valid JSON")
+                    
+        except Exception as e:
+            logger.error(f"Error processing message: {e}")
+    
+    def cleanup(self):
+        """Clean up resources"""
+        if self.consumer:
+            self.consumer.close()
+            logger.info("Consumer closed")
+
+def main():
+    """Main function to demonstrate usage"""
+    
+    # Configuration
+    config = {
+        'bootstrap_servers': ['kafka1.example.com:9092', 'kafka2.example.com:9092'],
+        'group_id': 'secure-consumer-group',
+        'keytab_path': '/path/to/your/service.keytab',
+        'principal': 'kafka-user@YOUR-REALM.COM',
+        'auto_offset_reset': 'earliest',
+        'enable_auto_commit': True,
+        
+        # Kerberos specific settings (no SSL)
+        'sasl_kerberos_service_name': 'kafka',
+        'sasl_kerberos_domain_name': None,  # Optional: specify if needed
+        'krb5_conf_path': '/etc/krb5.conf',  # Optional: specify krb5.conf path
+        'debug_kerberos': False,  # Set to True for Kerberos debugging
+    }
+    
+    # Topics to consume from
+    topics = ['your-topic-name', 'another-topic']
+    
+    try:
+        # Create and start consumer
+        consumer = SecureKafkaConsumer(config)
+        consumer.subscribe_and_consume(topics)
+        
+    except Exception as e:
+        logger.error(f"Application error: {e}")
+
+if __name__ == "__main__":
+    main()
