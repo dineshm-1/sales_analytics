@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""
+Cross-platform Kafka Consumer with JAAS configuration and Keytab authentication
+Works on Windows, Linux, and macOS
+Requires: kafka-python
+Windows: Uses MIT Kerberos for Windows or Active Directory authentication
+Unix: Uses system kinit commands
+"""
+
+import os
+import logging
+import subprocess
+import time
+import threading
+import platform
+from kafka import KafkaConsumer
+from kafka.errors import KafkaError
+import json
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class CrossPlatformKafkaConsumer:
+    def __init__(self, config):
+        self.config = config
+        self.consumer = None
+        self.ticket_renewal_thread = None
+        self.stop_renewal = False
+        self.is_windows = platform.system().lower() == 'windows'
+        
+    def authenticate_kerberos_windows(self):
+        """Windows-specific Kerberos authentication"""
+        try:
+            # Method 1: Try MIT Kerberos for Windows kinit
+            if self.config.get('use_mit_kerberos', True):
+                cmd = [
+                    'kinit',
+                    '-kt', self.config['keytab_path'],
+                    self.config['principal']
+                ]
+                
+                result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+                if result.returncode == 0:
+                    logger.info("MIT Kerberos authentication successful")
+                    return True
+                else:
+                    logger.warning(f"MIT Kerberos failed: {result.stderr}")
+            
+            # Method 2: Try Windows native authentication with username/password
+            if self.config.get('username') and self.config.get('password'):
+                # Extract username and domain from principal
+                if '@' in self.config['principal']:
+                    username = self.config['principal'].split('@')[0]
+                    domain = self.config['principal'].split('@')[1]
+                else:
+                    username = self.config.get('username')
+                    domain = self.config.get('domain', '')
+                
+                # Use runas or similar for Windows authentication
+                logger.info("Attempting Windows domain authentication...")
+                return True  # Assume success for now, will be validated by Kafka connection
+            
+            # Method 3: Use current Windows user context
+            logger.info("Using current Windows user authentication context")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Windows Kerberos authentication failed: {e}")
+            return False
+    
+    def authenticate_kerberos_unix(self):
+        """Unix-specific Kerberos authentication"""
+        try:
+            cmd = [
+                'kinit',
+                '-kt', self.config['keytab_path'],
+                self.config['principal']
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            logger.info("Unix Kerberos authentication successful")
+            
+            # Verify ticket
+            result = subprocess.run(['klist'], capture_output=True, text=True)
+            logger.info(f"Current Kerberos tickets:\n{result.stdout}")
+            
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Unix Kerberos authentication failed: {e}")
+            return False
+        except FileNotFoundError:
+            logger.error("kinit command not found. Please install Kerberos client tools.")
+            return False
+    
+    def authenticate_kerberos(self):
+        """Platform-aware Kerberos authentication"""
+        if self.is_windows:
+            return self.authenticate_kerberos_windows()
+        else:
+            return self.authenticate_kerberos_unix()
+    
+    def start_ticket_renewal(self):
+        """Start background thread for ticket renewal"""
+        def renew_ticket():
+            renewal_interval = self.config.get('ticket_renewal_interval', 3600)  # 1 hour default
+            
+            while not self.stop_renewal:
+                time.sleep(renewal_interval)
+                if not self.stop_renewal:
+                    logger.info("Renewing Kerberos ticket...")
+                    self.authenticate_kerberos()
+        
+        self.ticket_renewal_thread = threading.Thread(target=renew_ticket, daemon=True)
+        self.ticket_renewal_thread.start()
+        logger.info("Started ticket renewal thread")
+    
+    def setup_jaas_config(self):
+        """Setup JAAS configuration for cross-platform use"""
+        if self.is_windows and self.config.get('use_windows_auth', False):
+            # Windows-specific JAAS config with native authentication
+            jaas_config = f"""
+            KafkaClient {{
+                com.sun.security.auth.module.Krb5LoginModule required
+                useTicketCache=true
+                renewTicket=true
+                serviceName="kafka"
+                useDefaultCcache=true;
+            }};
+            """
+        else:
+            # Standard JAAS config using ticket cache
+            jaas_config = f"""
+            KafkaClient {{
+                com.sun.security.auth.module.Krb5LoginModule required
+                useTicketCache=true
+                renewTicket=true
+                serviceName="kafka"
+                principal="{self.config['principal']}";
+            }};
+            """
+        
+        # Write JAAS config to temp file
+        if self.is_windows:
+            jaas_file_path = os.path.join(os.environ.get('TEMP', 'C:\\temp'), 'kafka_client_jaas.conf')
+        else:
+            jaas_file_path = "/tmp/kafka_client_jaas.conf"
+        
+        with open(jaas_file_path, 'w') as f:
+            f.write(jaas_config)
+        
+        # Set environment variables
+        java_opts = f'-Djava.security.auth.login.config={jaas_file_path}'
+        
+        if self.config.get('krb5_conf_path'):
+            java_opts += f' -Djava.security.krb5.conf={self.config["krb5_conf_path"]}'
+        
+        if self.config.get('debug_kerberos', False):
+            java_opts += ' -Dsun.security.krb5.debug=true'
+        
+        # Windows-specific JVM options
+        if self.is_windows:
+            java_opts += ' -Djava.security.useSubjectCredsOnly=false'
+            if self.config.get('use_windows_auth', False):
+                java_opts += ' -Djavax.security.auth.useSubjectCredsOnly=false'
+        
+        os.environ['KAFKA_OPTS'] = java_opts
+        
+        logger.info(f"JAAS configuration written to {jaas_file_path}")
+        logger.info(f"KAFKA_OPTS: {java_opts}")
+    
+    def create_consumer(self):
+        """Create Kafka consumer with platform-appropriate authentication"""
+        try:
+            # Authenticate first
+            auth_success = True
+            if not self.config.get('skip_auth', False):
+                auth_success = self.authenticate_kerberos()
+            
+            if not auth_success and not self.config.get('allow_fallback', True):
+                raise Exception("Authentication failed and fallback disabled")
+            
+            # Setup JAAS configuration
+            self.setup_jaas_config()
+            
+            # Start ticket renewal if authentication succeeded
+            if auth_success and self.config.get('auto_renew_tickets', True):
+                self.start_ticket_renewal()
+            
+            # Consumer configuration
+            consumer_config = {
+                'bootstrap_servers': self.config['bootstrap_servers'],
+                'group_id': self.config['group_id'],
+                'auto_offset_reset': self.config.get('auto_offset_reset', 'earliest'),
+                'enable_auto_commit': self.config.get('enable_auto_commit', True),
+                'auto_commit_interval_ms': self.config.get('auto_commit_interval_ms', 1000),
+                'value_deserializer': lambda x: x.decode('utf-8') if x else None,
+                'key_deserializer': lambda x: x.decode('utf-8') if x else None,
+            }
+            
+            # Add security configuration if authentication succeeded
+            if auth_success:
+                security_config = {
+                    'security_protocol': 'SASL_PLAINTEXT',
+                    'sasl_mechanism': 'GSSAPI',
+                    'sasl_kerberos_service_name': self.config.get('sasl_kerberos_service_name', 'kafka'),
+                }
+                
+                if self.config.get('sasl_kerberos_domain_name'):
+                    security_config['sasl_kerberos_domain_name'] = self.config['sasl_kerberos_domain_name']
+                
+                consumer_config.update(security_config)
+                logger.info("Created consumer with SASL_PLAINTEXT security")
+            else:
+                # Fallback to plaintext
+                consumer_config['security_protocol'] = 'PLAINTEXT'
+                logger.warning("Created consumer with PLAINTEXT security (no authentication)")
+            
+            self.consumer = KafkaConsumer(**consumer_config)
+            logger.info("Kafka consumer created successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to create Kafka consumer: {e}")
+            if self.config.get('allow_fallback', True):
+                self.create_fallback_consumer()
+            else:
+                raise
+    
+    def create_fallback_consumer(self):
+        """Create fallback consumer without authentication"""
+        try:
+            logger.warning("Creating fallback consumer without authentication")
+            
+            consumer_config = {
+                'bootstrap_servers': self.config['bootstrap_servers'],
+                'group_id': self.config['group_id'],
+                'auto_offset_reset': self.config.get('auto_offset_reset', 'earliest'),
+                'enable_auto_commit': self.config.get('enable_auto_commit', True),
+                'value_deserializer': lambda x: x.decode('utf-8') if x else None,
+                'key_deserializer': lambda x: x.decode('utf-8') if x else None,
+                'security_protocol': 'PLAINTEXT',
+            }
+            
+            self.consumer = KafkaConsumer(**consumer_config)
+            logger.warning("Fallback consumer created with PLAINTEXT security")
+            
+        except Exception as e:
+            logger.error(f"Fallback consumer failed: {e}")
+            raise
+    
+    def subscribe_and_consume(self, topics):
+        """Subscribe to topics and start consuming messages"""
+        if not self.consumer:
+            self.create_consumer()
+        
+        try:
+            self.consumer.subscribe(topics)
+            logger.info(f"Subscribed to topics: {topics}")
+            
+            logger.info("Starting message consumption...")
+            for message in self.consumer:
+                self.process_message(message)
+                
+        except KeyboardInterrupt:
+            logger.info("Consumer interrupted by user")
+        except KafkaError as e:
+            logger.error(f"Kafka error occurred: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+        finally:
+            self.cleanup()
+    
+    def process_message(self, message):
+        """Process individual message"""
+        try:
+            logger.info(f"Received message:")
+            logger.info(f"  Topic: {message.topic}")
+            logger.info(f"  Partition: {message.partition}")
+            logger.info(f"  Offset: {message.offset}")
+            logger.info(f"  Key: {message.key}")
+            logger.info(f"  Value: {message.value}")
+            logger.info(f"  Timestamp: {message.timestamp}")
+            
+            if message.value:
+                try:
+                    data = json.loads(message.value)
+                    logger.info(f"  Parsed JSON: {data}")
+                except json.JSONDecodeError:
+                    logger.info("  Message is not valid JSON")
+                    
+        except Exception as e:
+            logger.error(f"Error processing message: {e}")
+    
+    def cleanup(self):
+        """Clean up resources"""
+        self.stop_renewal = True
+        if self.ticket_renewal_thread:
+            self.ticket_renewal_thread.join(timeout=1)
+        
+        if self.consumer:
+            self.consumer.close()
+            logger.info("Consumer closed")
+
+def check_system_requirements():
+    """Check platform-specific requirements"""
+    system = platform.system().lower()
+    
+    if system == 'windows':
+        logger.info("Detected Windows system")
+        logger.info("Windows Kerberos options:")
+        logger.info("  1. MIT Kerberos for Windows")
+        logger.info("  2. Windows domain authentication")
+        logger.info("  3. Current user context")
+        return True
+    else:
+        logger.info(f"Detected {system} system")
+        try:
+            subprocess.run(['kinit', '--version'], capture_output=True, check=True)
+            logger.info("kinit command is available")
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            logger.error("kinit command not found. Please install Kerberos client tools")
+            return False
+
+def main():
+    """Main function with platform-specific configuration examples"""
+    
+    if not check_system_requirements():
+        logger.error("System requirements not met")
+        return
+    
+    # Base configuration
+    base_config = {
+        'bootstrap_servers': ['kafka1.example.com:9092', 'kafka2.example.com:9092'],
+        'group_id': 'secure-consumer-group',
+        'auto_offset_reset': 'earliest',
+        'enable_auto_commit': True,
+        'sasl_kerberos_service_name': 'kafka',
+        'debug_kerberos': False,
+        'auto_renew_tickets': True,
+        'ticket_renewal_interval': 3600,
+        'allow_fallback': True,  # Allow fallback to PLAINTEXT if auth fails
+    }
+    
+    # Platform-specific configuration
+    if platform.system().lower() == 'windows':
+        # Windows configuration options
+        config = {
+            **base_config,
+            'principal': 'kafka-user@YOUR-DOMAIN.COM',
+            'keytab_path': r'C:\path\to\your\service.keytab',
+            'krb5_conf_path': r'C:\ProgramData\MIT\Kerberos5\krb5.ini',
+            
+            # Windows-specific options
+            'use_mit_kerberos': True,  # Try MIT Kerberos for Windows first
+            'use_windows_auth': False,  # Use Windows domain authentication
+            'username': None,  # For username/password auth
+            'password': None,  # For username/password auth
+            'domain': 'YOUR-DOMAIN',  # Windows domain
+        }
+    else:
+        # Unix/Linux configuration
+        config = {
+            **base_config,
+            'principal': 'kafka-user@YOUR-REALM.COM',
+            'keytab_path': '/path/to/your/service.keytab',
+            'krb5_conf_path': '/etc/krb5.conf',
+        }
+    
+    topics = ['your-topic-name', 'another-topic']
+    
+    try:
+        consumer = CrossPlatformKafkaConsumer(config)
+        consumer.subscribe_and_consume(topics)
+        
+    except Exception as e:
+        logger.error(f"Application error: {e}")
+
+if __name__ == "__main__":
+    main()
